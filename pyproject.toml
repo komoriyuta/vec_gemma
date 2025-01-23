@@ -1,0 +1,21 @@
+[project]
+name = "VecGemma"
+version = "0.1.0"
+description = "Connect embedding spaces with VAE"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3.2.0",
+    "fugashi>=1.4.0",
+    "huggingface-hub>=0.27.1",
+    "matplotlib>=3.10.0",
+    "notebook>=7.3.2",
+    "pandas>=2.2.3",
+    "python-dotenv>=1.0.1",
+    "schedulefree>=1.4",
+    "sentence-transformers>=3.4.0",
+    "sentencepiece>=0.2.0",
+    "torch>=2.5.1",
+    "transformers>=4.48.1",
+    "unidic-lite>=1.0.8",
+]
