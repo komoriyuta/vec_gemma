@@ -12,5 +12,3 @@ tokenizer
 .datasets
 # API etc.
 .env
-# uv
-uv.lock 
