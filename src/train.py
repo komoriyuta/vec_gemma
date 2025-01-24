@@ -5,7 +5,7 @@ import logging
 import random
 from pathlib import Path
 from huggingface_hub import snapshot_download
-
+import datetime
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -49,13 +49,14 @@ class TrainingConfig:
         self.vae_latent_dim = 512
         
         # 生成設定
-        self.sample_interval = 500
+        self.sample_interval = 1000
         self.num_samples = 3
         self.max_gen_length = 100
         self.generation_temp = 0.7
         self.generation_top_p = 0.9
         self.generation_top_k = 50
         
+        self.ckpt_interval = 5000
         # パス設定
         self.log_dir = "./logs"
         self.checkpoint_dir = "./checkpoints"
@@ -265,6 +266,16 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
                     global_step=epoch*len(train_loader)+step,
                     config=config
                 )
+            if step % config.ckpt_interval == 0:
+                checkpoint = {
+                    "epoch": epoch,
+                    "model_state": vae_model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "loss": loss.item(),
+                    "beta": beta
+                }
+                torch.save(checkpoint, os.path.join(config.checkpoint_dir, f"checkpoint_epoch_{epoch+1}_step_{datetime.datetime.now()}_{step}.pt"))
+                torch.save(vae_model.state_dict(), os.path.join(config.checkpoint_dir, "latest_model.pt"))
             optimizer.train()
             # Beta更新
             beta = min(config.beta_max, beta + config.beta_step)
@@ -289,11 +300,11 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
             "beta": beta
         }
         
-        torch.save(checkpoint, os.path.join(config.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt"))
+        torch.save(checkpoint, os.path.join(config.checkpoint_dir, f"checkpoint_epoch_{epoch+1}_{datetime.datetime.now()}.pt"))
         
         if loss.item() < best_loss:
             best_loss = loss.item()
-            torch.save(vae_model.state_dict(), os.path.join(config.checkpoint_dir, "best_model.pt"))
+            torch.save(vae_model.state_dict(), os.path.join(config.checkpoint_dir, f"best_model{datetime.datetime.now()}.pt"))
 
 if __name__ == "__main__":
     disable_progress_bars()
