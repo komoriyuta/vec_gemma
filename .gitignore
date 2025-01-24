@@ -9,6 +9,9 @@ tokenizer
 # Virtual environments
 .venv
 #cache
+logs
+checkpoints
+.vscode
 .datasets
 # API etc.
 .env

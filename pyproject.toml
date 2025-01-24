@@ -15,6 +15,7 @@ dependencies = [
     "schedulefree>=1.4",
     "sentence-transformers>=3.4.0",
     "sentencepiece>=0.2.0",
+    "tensorboard>=2.18.0",
     "torch>=2.5.1",
     "transformers>=4.48.1",
     "unidic-lite>=1.0.8",
