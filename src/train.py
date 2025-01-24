@@ -84,12 +84,10 @@ def prepare_dataset(config):
         return [item['text'] for item in batch]
     
     dataset = load_dataset(config.dataset_path, cache_dir="./.datasets")
-    def q(x):
-        x['text'] = "文章: "+x['text']
-        return x
+
     train_loader = DataLoader(
         
-        dataset['train'].map(q).with_format("torch"),
+        dataset['train'].with_format("torch"),
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
@@ -210,8 +208,9 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
         )
         for step, batch_texts in enumerate(progress_bar):
             with torch.no_grad():
+                rep_texts = ["文章: " + text for text in batch_texts]
                 bert_embeddings = bert_model.encode(
-                    batch_texts, 
+                    rep_texts, 
                     convert_to_tensor=True,
                     device=device,
                     show_progress_bar=False
