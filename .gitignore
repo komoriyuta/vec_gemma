@@ -15,3 +15,4 @@ checkpoints
 .datasets
 # API etc.
 .env
+nohup.out

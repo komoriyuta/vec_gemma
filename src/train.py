@@ -20,6 +20,7 @@ from sentence_transformers import SentenceTransformer
 
 from gemma.config import GemmaConfig, get_model_config
 from gemma.model import GemmaForCausalLM
+from VAEs.LinearVAE import LinearVAE
 from VAEs.VAE import VAE
 
 torch.set_float32_matmul_precision('high')
@@ -38,27 +39,28 @@ class TrainingConfig:
         self.lr = 1e-4
         self.num_epochs = 10
         self.grad_accum_steps = 4
-        self.beta_init = 0.1
-        self.beta_max = 0.8
-        self.beta_step = 1e-5
-        
+        self.beta_init = 0.05
+        self.beta_max = 0.4
+        self.beta_step = 1e-6
+        self.crop_lambda = 0.2
+
         # モデル設定
         self.bert_model_name = "cl-nagoya/ruri-large"
         self.gemma_model_size = "2b-v2"
-        self.vae_hidden_dim = 1024
-        self.vae_latent_dim = 512
+        self.vae_hidden_dim = 512
+        self.vae_latent_dim = 128
         
         # 生成設定
         self.sample_interval = 1000
         self.num_samples = 3
         self.max_gen_length = 100
-        self.generation_temp = 0.7
-        self.generation_top_p = 0.9
-        self.generation_top_k = 50
+        self.generation_temp = 0.1
+        self.generation_top_p = 0.2
+        self.generation_top_k = 2
         
         self.ckpt_interval = 5000
         # パス設定
-        self.log_dir = "./logs"
+        self.log_dir = f"./logs/{datetime.datetime.now()}/"
         self.checkpoint_dir = "./checkpoints"
         self.dataset_path = "AhmedSSabir/Japanese-wiki-dump-sentence-dataset"
         
@@ -86,7 +88,6 @@ def prepare_dataset(config):
     dataset = load_dataset(config.dataset_path, cache_dir="./.datasets")
 
     train_loader = DataLoader(
-        
         dataset['train'].with_format("torch"),
         batch_size=config.batch_size,
         shuffle=True,
@@ -123,7 +124,7 @@ def initialize_models(config, device):
     gemma_model.load_weights(ckpt_path)
     gemma_model = gemma_model.to(device).eval()
     # VAEモデル
-    vae_model = VAE(
+    vae_model = LinearVAE(
         bert_model.get_sentence_embedding_dimension(),
         gemma_model.config.hidden_size,
         hidden_dim=config.vae_hidden_dim,
@@ -139,12 +140,18 @@ def generate_and_log_samples(vae_model, bert_model, gemma_model, device, writer,
         "量子コンピュータの可能性",
         "ディープラーニングの応用分野",
         "自然言語処理の最新動向",
-        "ロボット工学の進化"
+        "ロボット工学の進化",
+        "一時期所長となる。",
+        "京都府京都市に生まれる。",
+        "卒業後は文章を書く仕事がしたいと1994年に報知新聞社にスポーツ記者として勤務し、高校野球やゴルフを取材する。",
+        "その後、全てをリセットするためにタンザニア・ダルエスサラーム大学に留学し、スワヒリ語科で学ぶ。",
+        "29歳の時に新人賞の最終候補に残るが、その後結婚し、出産したことで小説を書く余裕を無くしてしまう。",
+        "本形式は、192形を改称して生まれた形式である。",
+        "ただし、現実にはこの変更を受けたのは数両程度である。",  
     ]
     
     with torch.no_grad():
-        selected_texts = random.sample(sample_texts, config.num_samples)
-        prep_texts = ["文章: " + text for text in selected_texts]
+        prep_texts = ["文章: " + text for text in sample_texts]
         
         # BERTで埋め込みを取得
         bert_embeddings = bert_model.encode(
@@ -159,7 +166,7 @@ def generate_and_log_samples(vae_model, bert_model, gemma_model, device, writer,
         
         # Gemmaでテキスト生成
         generated_texts = []
-        for i in range(len(selected_texts)):
+        for i in range(len(sample_texts)):
             try:
                 embedding = vae_output[i].unsqueeze(0).unsqueeze(0)
                 generated = gemma_model.generate_with_initial_embedding(
@@ -176,8 +183,8 @@ def generate_and_log_samples(vae_model, bert_model, gemma_model, device, writer,
         
         # ログに記録
         log_text = "\n\n".join([
-            f"入力: {selected_texts[i]}\n生成結果: {generated_texts[i]}" 
-            for i in range(len(selected_texts))
+            f"入力: {sample_texts[i]}\n生成結果: {generated_texts[i]}" 
+            for i in range(len(sample_texts))
         ])
         
         writer.add_text("生成サンプル", log_text, global_step)
@@ -222,7 +229,11 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
                 
                 # 損失計算
                 kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-                kl_div = kl_div / bert_embeddings.size(0)
+                kl_div_per_batch = kl_div / bert_embeddings.size(0)  # バッチあたりのKL divergence
+                kl_div = torch.maximum(
+                    kl_div_per_batch,
+                    torch.tensor(config.crop_lambda, device=kl_div.device, dtype=kl_div.dtype)
+                )
                 
                 recon_loss = gemma_model.forward_teacher_forcing(
                     vae_output, 
@@ -267,11 +278,12 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
                 )
             if step % config.ckpt_interval == 0:
                 checkpoint = {
-                    "epoch": epoch,
+                    "epoch": epoch-1,
                     "model_state": vae_model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "loss": loss.item(),
-                    "beta": beta
+                    "beta": beta,
+                    "settings": config.__dict__
                 }
                 torch.save(checkpoint, os.path.join(config.checkpoint_dir, f"checkpoint_epoch_{epoch+1}_step_{datetime.datetime.now()}_{step}.pt"))
                 torch.save(vae_model.state_dict(), os.path.join(config.checkpoint_dir, "latest_model.pt"))
@@ -296,7 +308,8 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
             "model_state": vae_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "loss": loss.item(),
-            "beta": beta
+            "beta": beta,
+            "settings": config.__dict__
         }
         
         torch.save(checkpoint, os.path.join(config.checkpoint_dir, f"checkpoint_epoch_{epoch+1}_{datetime.datetime.now()}.pt"))
@@ -317,7 +330,6 @@ if __name__ == "__main__":
     
     # モデル初期化
     bert_model, gemma_model, vae_model = initialize_models(config, device)
-    print(vae_model.fc1.weight.dtype)  # torch.bfloat16 であることを確認
     optimizer = RAdamScheduleFree(vae_model.parameters(), lr=config.lr)
     
     # チェックポイントから再開
@@ -327,6 +339,8 @@ if __name__ == "__main__":
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         start_epoch = checkpoint["epoch"] + 1
         beta = checkpoint["beta"]
+        if "settings" in checkpoint:
+            config.__dict__.update(checkpoint["settings"])
         logging.info(f"エポック {start_epoch} からトレーニングを再開")
     else:
         start_epoch = 0
