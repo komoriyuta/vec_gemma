@@ -691,19 +691,34 @@ class GemmaForCausalLM(nn.Module):
         temperature: Union[float, None] = 0.95,
         top_p: float = 1.0,
         top_k: int = 100,
+        instruction_prompt1: str = "",      # ★追加★
     ) -> List[str]:
         """
-        Added by komoriyuta@2025
-        最初の1ステップだけ外部埋め込み `initial_embedding` を使い、
-        2ステップ目以降は通常の自己回帰 (得られたトークンIDをEmbeddingsに通す) でテキストを生成する。
+        VAE埋め込み + パラフレーズ等の指示をprefixとして、自己回帰生成を行う例
         """
-        # 前処理
+
         batch_size = initial_embedding.shape[0]
-        total_seq_len = 1 + output_len   # 「最初のステップ + 生成ステップ数」
-        pad_id = self.tokenizer.pad_id   # Gemma のトークナイザ
+        total_seq_len = 2 + output_len  # [VAE_emb, BOS, + output tokens]
+        pad_id = self.tokenizer.pad_id
+        bos_id = self.tokenizer.bos_id
         eos_id = self.tokenizer.eos_id
-        
-        # KVキャッシュを作成 (generate実装と同じ)
+
+        # ★1. instruction_prompt1 が空でない場合、先頭にさらにトークンを追加したい場合がある
+        #   ここでは「最初に"Paraphrase:" などのプロンプトをIDs化して合体する例を示す
+        if instruction_prompt1:
+            # text -> tokens
+            prompt_tokens = self.tokenizer.encode(instruction_prompt1, bos=False, eos=False)
+            # 例: [batch_size, prompt_length]
+            prompt_tokens_tensor = torch.tensor([prompt_tokens]*batch_size, dtype=torch.long, device=device)
+            prompt_len = prompt_tokens_tensor.size(1)
+        else:
+            prompt_tokens_tensor = None
+            prompt_len = 0
+
+        # 2. KVキャッシュの作成
+        #   あとで "prefix (VAE_emb + BOS + [instruction_prompt])" 分に対応できるよう
+        #   長さ (2 + prompt_len + output_len) を確保するなど。
+        total_seq_len = 2 + prompt_len + output_len
         kv_caches = []
         for _ in range(self.config.num_hidden_layers):
             size = (batch_size, total_seq_len, self.config.num_key_value_heads, self.config.head_dim)
@@ -712,106 +727,116 @@ class GemmaForCausalLM(nn.Module):
             v_cache = torch.zeros(size=size, dtype=dtype, device=device)
             kv_caches.append((k_cache, v_cache))
 
-        token_ids_tensor = torch.full(
-            (batch_size, total_seq_len),
-            pad_id,
-            dtype=torch.long,
-            device=device
-        )
+        # 3. token_ids_tensor (最終生成結果) を初期化
+        token_ids_tensor = torch.full((batch_size, total_seq_len), pad_id, dtype=torch.long, device=device)
 
-        mask = torch.full(
-            (1, 1, total_seq_len, total_seq_len),
-            -1.0e10,
-            dtype=self.config.get_dtype(),
-            device=device
-        )
+        #   index 0: VAE embedding (実際のトークンIDは存在しないが…)
+        #   index 1: BOS
+        #   さらに続いて prompt tokens (長さ prompt_len)
+        #   そのあと出力を塗りつぶしていく
+        
+        # BOS 設定
+        token_ids_tensor[:, 1] = bos_id
+
+        # prompt_tokens を配置
+        if prompt_len > 0:
+            token_ids_tensor[:, 2:2+prompt_len] = prompt_tokens_tensor
+
+        # 4. 因果的マスク
+        mask = torch.full((1, 1, total_seq_len, total_seq_len),
+                        float("-inf"),
+                        dtype=self.config.get_dtype(),
+                        device=device)
         mask = torch.triu(mask, diagonal=1)
 
-        normalizer = (self.config.hidden_size**0.5)
-        hidden_states = initial_embedding * normalizer  # [batch_size, 1, hidden_size]
+        normalizer = self.config.hidden_size ** 0.5
 
-        # Rotary埋め込み用 index
-        positions_0 = torch.zeros(1, dtype=torch.long, device=device)  # [0]
-        freqs_cis = self.freqs_cis.index_select(0, positions_0)
+        # 5. prefix部分をまとめて forward して KVキャッシュに格納 (VAE埋め込み + BOS + prompt)
+        #   VAE 埋め込み: index 0
+        #   BOS         : index 1
+        #   prompt      : index [2 : 2+prompt_len-1]
+        prefix_len = 2 + prompt_len
 
-        # (hidden_states.shape: [batch_size, 1, hidden_size])
+        # embedding (VAE_emb + BOS + prompt) をまとめて計算
+        # 先頭の index0 は VAE埋め込み( [batch,1,hidden_dim] )
+        # BOS と prompt は self.embedder(token_ids_tensor[:,1:prefix_len]) で
+        # embedding して cat する
+        # ... 簡易実装例:
+        vae_emb = initial_embedding * normalizer  # [batch,1,hidden_dim]
+        bos_and_prompt_ids = token_ids_tensor[:, 1:prefix_len]  # [batch, prefix_len-1]
+        bos_and_prompt_emb = self.embedder(bos_and_prompt_ids) * normalizer
+        prefix_embeddings = torch.cat([vae_emb, bos_and_prompt_emb], dim=1)  # [batch, prefix_len, hidden_dim]
+
+        # prefixを一括forward
+        input_positions = torch.arange(prefix_len, device=device)
         hidden_states = self.model(
-            hidden_states=hidden_states,
-            freqs_cis=freqs_cis,
-            kv_write_indices=positions_0,   # 0番目に書き込み
+            hidden_states=prefix_embeddings,
+            freqs_cis=self.freqs_cis.index_select(0, input_positions),
+            kv_write_indices=input_positions,
             kv_caches=kv_caches,
-            mask=mask.index_select(2, positions_0),
+            mask=mask.index_select(2, input_positions),
         )
 
-        # 次トークンをサンプリング
-        embedder_weight = self.embedder.weight
-        if self.config.quant:
-            embedder_weight = embedder_weight * self.embedder.weight_scaler.unsqueeze(-1)
+        # 6. 残りの output_len トークンを自己回帰的に生成
+        output_offset = prefix_len  # 最初の出力トークンを格納する位置
+        temperatures = None if not temperature else torch.tensor([temperature]*batch_size, device=device)
+        top_ps = torch.tensor([top_p]*batch_size, device=device)
+        top_ks = torch.tensor([top_k]*batch_size, device=device)
 
-        # output_positions は [0]（= hidden_states の最後のトークン位置）でOK
-        next_token_ids, _ = self.sampler(
-            embedding=embedder_weight,
-            hidden_states=hidden_states,
-            output_positions=positions_0,
-            temperatures=(None if temperature is None else torch.full((batch_size,), temperature, device=device)),
-            top_ps=torch.full((batch_size,), top_p, dtype=torch.float, device=device),
-            top_ks=torch.full((batch_size,), top_k, dtype=torch.long, device=device),
-        )
-        # token_ids_tensor に書き込み
-        token_ids_tensor[:, 0] = next_token_ids
+        for step_idx in range(output_len):
+            curr_position = torch.tensor([output_offset], device=device, dtype=torch.long)
+            # 前ステップでサンプリングor決定したトークンID
+            if step_idx == 0:
+                # prefixの最後のトークンID (prompt の末尾 or BOS)
+                prev_token_id = token_ids_tensor[:, output_offset-1].unsqueeze(1)
+            else:
+                prev_token_id = token_ids_tensor[:, output_offset-1].unsqueeze(1)
 
-        # 2ステップ目以降: 通常の "トークンID -> Embedding" で自己回帰
-        # -------------------------------------------------------------
-        for step_idx in range(1, total_seq_len):
-            # 前ステップでサンプリングされたトークン
-            curr_input_ids = token_ids_tensor[:, step_idx-1].unsqueeze(1)  # shape: [batch_size, 1]
-            
-            # EOS がもう出ていたら、そのバッチは生成を打ち切ってもOK
-            # 今回は簡単のためループ継続しつつEOTだけ明示 (必要に応じてbreak)
-            # is_eos = (curr_input_ids == eos_id).all()
-            # if is_eos: break
+            # embedding 計算
+            prev_token_emb = self.embedder(prev_token_id) * normalizer
 
-            # 次の positions
-            positions_t = torch.tensor([step_idx], device=device, dtype=torch.long)  # [step_idx]
-            # アテンションマスクを該当位置だけ抜き出す
-            mask_t = mask.index_select(2, positions_t)
-
-            # このステップ入力をEmbedding化
-            embed = self.embedder(curr_input_ids)  # [batch_size, 1, hidden_size]
-            embed = embed * normalizer
-
-            # デコーダ forward
-            hidden_states = self.model(
-                hidden_states=embed,
-                freqs_cis=self.freqs_cis.index_select(0, positions_t),
-                kv_write_indices=positions_t,
+            # forward
+            hs = self.model(
+                hidden_states=prev_token_emb,
+                freqs_cis=self.freqs_cis.index_select(0, curr_position),
+                kv_write_indices=curr_position,
                 kv_caches=kv_caches,
-                mask=mask_t,
+                mask=mask.index_select(2, curr_position),
             )
 
-            # sampler で次トークンをサンプリング
-            next_tokens, _ = self.sampler(
-                embedding=embedder_weight,
-                hidden_states=hidden_states,
-                output_positions=torch.zeros_like(positions_t),  # ローカル(=1トークン分)ではindex=0
-                temperatures=(None if temperature is None else torch.full((batch_size,), temperature, device=device)),
-                top_ps=torch.full((batch_size,), top_p, dtype=torch.float, device=device),
-                top_ks=torch.full((batch_size,), top_k, dtype=torch.long, device=device),
-            )
-            # token_ids_tensor に格納
-            token_ids_tensor[:, step_idx] = next_tokens
+            # sampler
+            embed_weight = self.embedder.weight
+            if self.config.quant:
+                embed_weight = embed_weight * self.embedder.weight_scaler.unsqueeze(-1)
 
-        # バッチごとの生成結果を取り出して文字列化
+            next_token_ids, _ = self.sampler(
+                embedding=embed_weight,
+                hidden_states=hs,
+                output_positions=torch.zeros_like(curr_position),
+                temperatures=temperatures,
+                top_ps=top_ps,
+                top_ks=top_ks,
+            )
+
+            token_ids_tensor[:, output_offset] = next_token_ids
+            output_offset += 1
+
+            # EOSチェックなど好きに処理
+
+        # 最後にパディングを除いた実際の出力を取り出し、デコード
         results = []
         for i in range(batch_size):
-            out_tokens = token_ids_tensor[i].tolist()
+            # prefix_len までは [vae_emb, bos, promptTokens] なので除く
+            out_tokens = token_ids_tensor[i, prefix_len: ].tolist()
+            # EOS まで切り詰め
             if eos_id in out_tokens:
-                eos_pos = out_tokens.index(eos_id)
-                out_tokens = out_tokens[:eos_pos]
-            out_text = self.tokenizer.decode(out_tokens)
-            results.append(out_text)
+                idx = out_tokens.index(eos_id)
+                out_tokens = out_tokens[:idx]
+            text = self.tokenizer.decode(out_tokens)
+            results.append(text)
 
         return results
+
 
     def encode_texts(
         self,
@@ -857,95 +882,192 @@ class GemmaForCausalLM(nn.Module):
 
     def forward_teacher_forcing(
         self,
-        vae_embedding: torch.Tensor,  # [batch_size, hidden_size]
-        target_texts: List[str],       # 入力テキストのリスト
-        max_seq_len: int = 512,        # 最大シーケンス長
+        vae_embedding: torch.Tensor,      # [batch_size, hidden_size]
+        target_texts: List[str],          # 教師データテキストのリスト
+        max_seq_len: int = 512,
+        instruction_prompt0: str = "",    # VAE埋め込みの前につけるプロンプト
+        instruction_prompt1: str = "",    # VAE埋め込みの後につけるプロンプト
     ) -> torch.Tensor:
         """
-        Added by komoriyuta
-        VAE埋め込みをBOSトークン位置に配置しTeacher Forcingで学習
-        
-        Args:
-            vae_embedding: BERT→VAEを経由した埋め込み
-            target_texts: 教師データテキスト
-            max_seq_len: 処理する最大トークン長
-            
-        Returns:
-            loss: 損失値
+        VAE埋め込みをprefixとして + (instruction_prompt0, instruction_prompt1) を挟んで、
+        それを前置きにした状態で、実際のtarget_textsを教師強制で学習する例。
+
+        シーケンス例:
+        [prompt0_tokens] + [VAE埋め込み] + [prompt1_tokens] + [target文トークン]
+        ただし VAE埋め込みの位置にはラベルとして pad_id を置き、ignore_index=pad_id により損失を無視する。
         """
-        # テキスト→トークンID変換
-        target_ids, attention_mask = self.encode_texts(
-            texts=target_texts,
-            max_seq_len=max_seq_len,
-            add_bos=True,  # BOSを自動追加
-            add_eos=True,  # EOSを自動追加
-        )
-        
-        # Embedding置換処理
-        token_embeddings = self.embedder(target_ids)  # [batch, seq, hidden]
-        token_embeddings[:, 0, :] = vae_embedding  # BOS位置をVAE埋め込みで置換
-        
-        # 正規化
-        normalizer = torch.tensor(
-            self.config.hidden_size**0.5,
-            dtype=token_embeddings.dtype
-        )
-        token_embeddings = token_embeddings * normalizer
 
-        # 位置エンコーディング
-        seq_len = target_ids.size(1)
-        positions = torch.arange(seq_len, device=target_ids.device)
-        freqs_cis = self.freqs_cis.index_select(0, positions)
+        device = self.embedder.weight.device
+        batch_size = len(target_texts)
+        pad_id = self.tokenizer.pad_id
+        eos_id = self.tokenizer.eos_id
+        bos_id = self.tokenizer.bos_id
 
-        # 因果的マスク + パディングマスク
+        # --------------------------------------------------
+        # 1) instruction_prompt0, instruction_prompt1 をトークン化
+        # --------------------------------------------------
+        prompt0_tokens = []
+        if instruction_prompt0:
+            prompt0_tokens = self.tokenizer.encode(instruction_prompt0, bos=False, eos=False)
+        prompt1_tokens = []
+        if instruction_prompt1:
+            prompt1_tokens = self.tokenizer.encode(instruction_prompt1, bos=False, eos=False)
+
+        prompt0_len = len(prompt0_tokens)
+        prompt1_len = len(prompt1_tokens)
+
+        # --------------------------------------------------
+        # 2) target_texts を bos=True, eos=True でトークン化（例）
+        #    残り長が足りない場合は切り詰め
+        # --------------------------------------------------
+        # このとき最大長は (max_seq_len - (prompt0_len + 1 + prompt1_len))
+        max_len_for_target = max_seq_len - (prompt0_len + 1 + prompt1_len)
+        token_list_batch = []
+        for text in target_texts:
+            tokens = self.tokenizer.encode(text, bos=True, eos=True)
+            # 長すぎたら切り詰め
+            if len(tokens) > max_len_for_target:
+                tokens = tokens[:max_len_for_target]
+                # 必要なら tokens[-1] = eos_id など
+            token_list_batch.append(tokens)
+
+        # パディング
+        padded_targets = []
+        for tokens in token_list_batch:
+            pad_size = max_len_for_target - len(tokens)
+            padded_targets.append(tokens + [pad_id]*pad_size)
+        # [batch_size, max_len_for_target]
+        padded_targets = torch.tensor(padded_targets, dtype=torch.long, device=device)
+
+        # --------------------------------------------------
+        # 3) prefix (prompt0 + VAE埋め込み + prompt1) と target を連結
+        # --------------------------------------------------
+        # prefixトークンID (VAE埋め込み部分はダミーで pad_id)
+        # 大きさ = [batch_size, prompt0_len + 1 + prompt1_len]
+        prefix_id_list = []
+        for _ in range(batch_size):
+            # prompt0 部分 + (VAE埋め込みの位置=pad_id) + prompt1 部分
+            prefix_ids = prompt0_tokens + [pad_id] + prompt1_tokens
+            prefix_id_list.append(prefix_ids)
+
+        prefix_ids_tensor = torch.tensor(prefix_id_list, dtype=torch.long, device=device)
+        prefix_len = prompt0_len + 1 + prompt1_len
+        full_seq_len = prefix_len + max_len_for_target  # 全体長
+
+        # [batch_size, full_seq_len]
+        full_token_ids = torch.cat([prefix_ids_tensor, padded_targets], dim=1)
+
+        # --------------------------------------------------
+        # 4) ラベルも同様に作成: ただし VAE埋め込み位置には pad_id を入れて損失を無視
+        # --------------------------------------------------
+        # ここでは「prefix_ids_tensor」自体がラベルとしても同じ形をとるが、
+        # VAE埋め込み位置 (prompt0_len の箇所) を pad_id にしておくことで損失0扱いに
+        #
+        # → 既に prefix_ids_tensor では VAE埋め込み位置を pad_id にしているので、
+        #    そのまま使ってOK
+        #
+        full_labels = full_token_ids.clone()  # [batch_size, full_seq_len]
+        # (もし何か特殊トークンIDをおきたいなら、ここで上書きすればOK)
+        # full_labels[:, prompt0_len] = pad_id
+
+        # --------------------------------------------------
+        # 5) attention_mask (パディング部 False)
+        # --------------------------------------------------
+        attention_mask = (full_token_ids != pad_id)  # [batch_size, full_seq_len]
+
+        # --------------------------------------------------
+        # 6) 埋め込み計算
+        #    - prompt0_tokens, prompt1_tokens, target_tokens は通常
+        #    - VAE埋め込み位置だけ特殊なベクトルを差し込む
+        # --------------------------------------------------
+        # (a) prompt0部
+        if prompt0_len > 0:
+            prompt0_ids = full_token_ids[:, :prompt0_len]
+            prompt0_emb = self.embedder(prompt0_ids) * (self.config.hidden_size**0.5)
+        else:
+            prompt0_emb = torch.zeros(batch_size, 0, self.config.hidden_size, device=device)
+
+        # (b) VAE埋め込み (1トークン分)
+        #    prefix_ids_tensor[:, prompt0_len] は pad_id (ダミー)
+        vae_emb_2d = vae_embedding.unsqueeze(1)  # [batch, 1, hidden_size]
+        vae_emb_2d = vae_emb_2d * (self.config.hidden_size**0.5)
+
+        # (c) prompt1部
+        if prompt1_len > 0:
+            start_p1 = prompt0_len + 1
+            end_p1   = prompt0_len + 1 + prompt1_len
+            prompt1_ids = full_token_ids[:, start_p1:end_p1]
+            prompt1_emb = self.embedder(prompt1_ids) * (self.config.hidden_size**0.5)
+        else:
+            prompt1_emb = torch.zeros(batch_size, 0, self.config.hidden_size, device=device)
+
+        # (d) target部 (後ろ)
+        target_ids = full_token_ids[:, prefix_len:]  # [batch, max_len_for_target]
+        target_emb = self.embedder(target_ids) * (self.config.hidden_size**0.5)
+
+        # concat
+        input_embeddings = torch.cat([prompt0_emb, vae_emb_2d, prompt1_emb, target_emb], dim=1)
+        # shape: [batch, full_seq_len, hidden_size]
+
+        # --------------------------------------------------
+        # 7) 因果的マスク + paddingマスク
+        # --------------------------------------------------
         causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), -torch.inf, device=target_ids.device),
+            torch.full((full_seq_len, full_seq_len), float("-inf"), device=device),
             diagonal=1
         )
-        padding_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq]
-        combined_mask = causal_mask.masked_fill(~padding_mask, -torch.inf)
+        causal_mask = causal_mask.unsqueeze(0)  # [1, full_seq_len, full_seq_len]
 
-        # KVキャッシュ初期化
+        # paddingマスクをブロードキャスト
+        # True(有効)の箇所だけ保持、False(無効)を -inf に
+        padding_mask_4d = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch,1,1, full_seq_len]
+        combined_mask = causal_mask.masked_fill(~padding_mask_4d, float("-inf"))
+
+        # --------------------------------------------------
+        # 8) KVキャッシュ作成 & forward
+        # --------------------------------------------------
         kv_caches = []
         for _ in range(self.config.num_hidden_layers):
-            size = (
-                target_ids.size(0),
-                seq_len,
-                self.config.num_key_value_heads,
-                self.config.head_dim
-            )
+            size = (batch_size, full_seq_len, self.config.num_key_value_heads, self.config.head_dim)
             dtype = self.config.get_dtype()
-            kv_caches.append((
-                torch.zeros(size, dtype=dtype, device=target_ids.device),
-                torch.zeros(size, dtype=dtype, device=target_ids.device)
-            ))
+            k_cache = torch.zeros(size=size, dtype=dtype, device=device)
+            v_cache = torch.zeros(size=size, dtype=dtype, device=device)
+            kv_caches.append((k_cache, v_cache))
 
-        # モデルのフォワード処理
+        positions = torch.arange(full_seq_len, device=device, dtype=torch.long)
         hidden_states = self.model(
-            hidden_states=token_embeddings,
-            freqs_cis=freqs_cis,
+            hidden_states=input_embeddings,
+            freqs_cis=self.freqs_cis.index_select(0, positions),
             kv_write_indices=positions,
             kv_caches=kv_caches,
             mask=combined_mask,
         )
 
-        # ロジット計算
+        # --------------------------------------------------
+        # 9) ロジット計算
+        # --------------------------------------------------
         embed_weight = self.embedder.weight
         if self.config.quant:
             embed_weight = embed_weight * self.embedder.weight_scaler.unsqueeze(-1)
-        logits = torch.matmul(hidden_states, embed_weight.t())
+        logits = torch.matmul(hidden_states, embed_weight.t())  # [batch, full_seq_len, vocab_size]
 
-        # 損失計算 (BOS位置を除外)
-        shift_logits = logits[:, :-1, :].contiguous()  # 次単語
-        shift_labels = target_ids[:, 1:].contiguous()
-        
+        # --------------------------------------------------
+        # 10) 損失計算 (shift)
+        #     先頭トークンを除外し、次トークンを予測
+        # --------------------------------------------------
+        shift_logits = logits[:, 1:, :]         # [batch, full_seq_len-1, vocab_size]
+        shift_labels = full_labels[:, 1:]       # [batch, full_seq_len-1]
+
         loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=self.tokenizer.pad_id,
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            ignore_index=pad_id,  # <= VAE埋め込み位置を含む pad_id は無視される
         )
 
         return loss
+
+
+
 #追加実装ここまで
     def load_weights(self, model_path: str):
         if os.path.isfile(model_path):

@@ -10,7 +10,8 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
-
+from dotenv import load_dotenv
+load_dotenv()
 from datasets import disable_progress_bars
 disable_progress_bars()
 from datasets import load_dataset
@@ -22,6 +23,8 @@ from gemma.config import GemmaConfig, get_model_config
 from gemma.model import GemmaForCausalLM
 from VAEs.LinearVAE import LinearVAE
 from VAEs.VAE import VAE
+import kagglehub
+
 
 torch.set_float32_matmul_precision('high')
 
@@ -114,6 +117,9 @@ def initialize_models(config, device):
     ckpt_path = os.path.join(snapshot_dir, f'model.ckpt')
     assert os.path.isfile(ckpt_path), 'PyTorch checkpoint not found!'
 
+
+    
+
     gemma_model_config = get_model_config("2b-v2")
     gemma_model_config.tokenizer = tokenizer_path
     
@@ -175,7 +181,8 @@ def generate_and_log_samples(vae_model, bert_model, gemma_model, device, writer,
                     output_len=config.max_gen_length,
                     temperature=config.generation_temp,
                     top_p=config.generation_top_p,
-                    top_k=config.generation_top_k
+                    top_k=config.generation_top_k,
+                    instruction_prompt="\n 以上の文章を繰り返してください:"
                 )
                 generated_texts.append(generated[0])
             except Exception as e:
@@ -196,6 +203,18 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
     writer = SummaryWriter(config.log_dir)
     setup_logging(config.log_dir)
     
+    instructions = [
+        "以上の文章の繰り返し:",
+        "\n 上記のテキストを出力してください:",
+        "以上の文章を繰り返してください:",
+        "\n 以上に示した文をそのまま出力してください:",
+        "\n 以上の文の内容:",
+        "\n 上記の文章の繰り返し:",
+        "\n Repeat that texts:",
+        "\n Repeat the above text:",
+    ]
+
+
     #scaler = torch.amp.GradScaler()
     best_loss = float('inf')
     beta = initial_beta
@@ -238,7 +257,8 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
                 recon_loss = gemma_model.forward_teacher_forcing(
                     vae_output, 
                     batch_texts,
-                    max_seq_len=config.max_seq_len
+                    max_seq_len=config.max_seq_len,
+                    instruction_prompt=instructions[random.randint(0, len(instructions)-1)],
                 )
                 
                 loss = recon_loss + beta * kl_div
@@ -274,7 +294,7 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
                     device=device,
                     writer=writer,
                     global_step=epoch*len(train_loader)+step,
-                    config=config
+                    config=config,
                 )
             if step % config.ckpt_interval == 0:
                 checkpoint = {

@@ -16,3 +16,4 @@ checkpoints
 # API etc.
 .env
 nohup.out
+test.ipynb
