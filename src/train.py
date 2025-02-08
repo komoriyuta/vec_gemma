@@ -181,7 +181,7 @@ def generate_and_log_samples(vae_model, bert_model, gemma_model, device, writer,
                     temperature=config.generation_temp,
                     top_p=config.generation_top_p,
                     top_k=config.generation_top_k,
-                    instructions=("<start_of_turn>user\"", "\"\nこれを、そのままの意味で出力してください<end_of_turn><start_of_turn>model\n")
+                    instructions=("<start_of_turn>user\n \"", "\"\nこれをそのままの意味で出力してください。<end_of_turn>\n<start_of_turn>model\n")
                 )
                 generated_texts.append(generated[0])
             except Exception as e:

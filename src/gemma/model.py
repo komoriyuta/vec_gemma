@@ -890,13 +890,13 @@ class GemmaForCausalLM(nn.Module):
 
         # 1. タプルから instruction_prompt0 と instruction_prompt1 を取得（BOS/EOSは付与しない）
         instruction_prompt0, instruction_prompt1 = instructions
-        seq0 = self.tokenizer.encode(instruction_prompt0, bos=False, eos=False) if instruction_prompt0 else []
+        seq0 = self.tokenizer.encode(instruction_prompt0, bos=True, eos=False) if instruction_prompt0 else []
         seq1 = self.tokenizer.encode(instruction_prompt1, bos=False, eos=False) if instruction_prompt1 else []
 
         # 2. 各 target_text を BOS/EOS 付きでトークン化
         target_ids_list = []
         for text in target_texts:
-            tokens = self.tokenizer.encode(text+'<end_of_turn>', bos=True, eos=True)
+            tokens = self.tokenizer.encode(text+'\n <end_of_turn>', bos=False, eos=True)
             target_ids_list.append(tokens)
 
         # 3. 各サンプルの最終シーケンスは以下の連結になる：
