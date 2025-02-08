@@ -708,7 +708,7 @@ class GemmaForCausalLM(nn.Module):
 
         # 1. タプルから instruction_prompt0 と instruction_prompt1 を取得し、トークン化（BOS/EOS なし）
         instruction_prompt0, instruction_prompt1 = instructions
-        seq0 = self.tokenizer.encode(instruction_prompt0, bos=False, eos=False) if instruction_prompt0 else []
+        seq0 = self.tokenizer.encode(instruction_prompt0, bos=True, eos=False) if instruction_prompt0 else []
         seq1 = self.tokenizer.encode(instruction_prompt1, bos=False, eos=False) if instruction_prompt1 else []
 
         # 2. prefix 部分のトークン列を作成  
