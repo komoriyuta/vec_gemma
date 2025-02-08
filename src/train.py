@@ -23,7 +23,6 @@ from gemma.config import GemmaConfig, get_model_config
 from gemma.model import GemmaForCausalLM
 from VAEs.LinearVAE import LinearVAE
 from VAEs.VAE import VAE
-import kagglehub
 
 
 torch.set_float32_matmul_precision('high')
@@ -182,7 +181,7 @@ def generate_and_log_samples(vae_model, bert_model, gemma_model, device, writer,
                     temperature=config.generation_temp,
                     top_p=config.generation_top_p,
                     top_k=config.generation_top_k,
-                    instruction_prompt="\n 以上の文章を繰り返してください:"
+                    instructions=("<start_of_turn>user\"", "\"\nこれを、そのままの意味で出力してください<end_of_turn><start_of_turn>model\n")
                 )
                 generated_texts.append(generated[0])
             except Exception as e:
@@ -204,15 +203,29 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
     setup_logging(config.log_dir)
     
     instructions = [
-        "以上の文章の繰り返し:",
-        "\n 上記のテキストを出力してください:",
-        "以上の文章を繰り返してください:",
-        "\n 以上に示した文をそのまま出力してください:",
-        "\n 以上の文の内容:",
-        "\n 上記の文章の繰り返し:",
-        "\n Repeat that texts:",
-        "\n Repeat the above text:",
+        ("<start_of_turn>user次の文をそのまま出力して:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user以下の文を変更せずに出力してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>userこの文章をそのまま返してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user次の内容をそのまま出力してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user以下のテキストをそのまま返してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user次のデータを変更せずに出力してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>userこの情報をそのまま返してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user以下の内容をそのまま再現してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user次の文をそのまま表示してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>userこのデータを変更せずに返してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user次の文をそのまま出力して:\"", "\"\nこの内容をそのまま出力してください。<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user以下の文をそのまま返してください:\"", "\"\n意味を変えずにそのまま出力してください。<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user次の内容を正確に再現してください:\"", "\"\nそのままの形で出力してください。<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user次のデータを変更せずに出力してください:\"", "\"\n情報を保持したまま出力してください。<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>userこの情報をそのまま返してください:\"", "\"\n入力されたまま出力してください。<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user\"", "\"\nこれを、そのままの意味で出力してください<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user\"", "\"\nそのまま出力してください。<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user\"", "\"\nこの内容を変更せずに出力してください。<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user\"", "\"\nこのままの形で出力してください。<end_of_turn><start_of_turn>model\n"),
+        ("<start_of_turn>user\"", "\"\n入力通りにそのまま返してください。<end_of_turn><start_of_turn>model\n")
     ]
+
+
 
 
     #scaler = torch.amp.GradScaler()
@@ -258,7 +271,7 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
                     vae_output, 
                     batch_texts,
                     max_seq_len=config.max_seq_len,
-                    instruction_prompt=instructions[random.randint(0, len(instructions)-1)],
+                    instructions=instructions[random.randint(0, len(instructions)-1)],
                 )
                 
                 loss = recon_loss + beta * kl_div
