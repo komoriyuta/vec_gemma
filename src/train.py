@@ -23,6 +23,7 @@ from gemma.config import GemmaConfig, get_model_config
 from gemma.model import GemmaForCausalLM
 from VAEs.LinearVAE import LinearVAE
 from VAEs.VAE import VAE
+from VAEs.Perceptron import Perceptron
 
 
 torch.set_float32_matmul_precision('high')
@@ -41,7 +42,7 @@ class TrainingConfig:
         self.lr = 1e-4
         self.num_epochs = 10
         self.grad_accum_steps = 4
-        self.beta_init = 0.05
+        self.beta_init = 0.0
         self.beta_max = 0.4
         self.beta_step = 1e-6
         self.crop_lambda = 0.2
@@ -115,8 +116,6 @@ def initialize_models(config, device):
     # Ensure that the checkpoint is present
     ckpt_path = os.path.join(snapshot_dir, f'model.ckpt')
     assert os.path.isfile(ckpt_path), 'PyTorch checkpoint not found!'
-
-
     
 
     gemma_model_config = get_model_config("2b-v2")
@@ -181,7 +180,7 @@ def generate_and_log_samples(vae_model, bert_model, gemma_model, device, writer,
                     temperature=config.generation_temp,
                     top_p=config.generation_top_p,
                     top_k=config.generation_top_k,
-                    instructions=("<start_of_turn>user\n \"", "\"\nこれをそのままの意味で出力してください。<end_of_turn>\n<start_of_turn>model\n")
+                    instructions=("<start_of_turn>user以下の内容をそのまま再現してください:\"", "\"\n<end_of_turn><start_of_turn>model\n")
                 )
                 generated_texts.append(generated[0])
             except Exception as e:
@@ -202,7 +201,10 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
     writer = SummaryWriter(config.log_dir)
     setup_logging(config.log_dir)
     
+
+    # プロンプトのリスト（前半, 後半）
     instructions = [
+        # 基本パターン（指示あり）
         ("<start_of_turn>user次の文をそのまま出力して:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>user以下の文を変更せずに出力してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>userこの文章をそのまま返してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
@@ -213,12 +215,16 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
         ("<start_of_turn>user以下の内容をそのまま再現してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>user次の文をそのまま表示してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>userこのデータを変更せずに返してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+
+        # インストラクション付き
         ("<start_of_turn>user次の文をそのまま出力して:\"", "\"\nこの内容をそのまま出力してください。<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>user以下の文をそのまま返してください:\"", "\"\n意味を変えずにそのまま出力してください。<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>user次の内容を正確に再現してください:\"", "\"\nそのままの形で出力してください。<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>user次のデータを変更せずに出力してください:\"", "\"\n情報を保持したまま出力してください。<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>userこの情報をそのまま返してください:\"", "\"\n入力されたまま出力してください。<end_of_turn><start_of_turn>model\n"),
-        ("<start_of_turn>user\"", "\"\nこれを、そのままの意味で出力してください<end_of_turn><start_of_turn>model\n"),
+
+        # "<start_of_turn>user\"" のみ
+        ("<start_of_turn>user\"", "\"\n<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>user\"", "\"\nそのまま出力してください。<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>user\"", "\"\nこの内容を変更せずに出力してください。<end_of_turn><start_of_turn>model\n"),
         ("<start_of_turn>user\"", "\"\nこのままの形で出力してください。<end_of_turn><start_of_turn>model\n"),

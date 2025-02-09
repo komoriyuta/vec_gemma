@@ -864,7 +864,7 @@ class GemmaForCausalLM(nn.Module):
         return token_ids, attention_mask
     def forward_teacher_forcing(
         self,
-        vae_embedding: torch.Tensor,      # shape: [batch_size, hidden_size] (前と同様)
+        vae_embedding: torch.Tensor,      # shape: [batch_size, hidden_size]
         target_texts: List[str],            # 教師データのテキスト（各サンプル）
         max_seq_len: int = 512,
         instructions: Tuple[str, str] = ("", ""),  # (instruction_prompt0, instruction_prompt1)
@@ -874,10 +874,10 @@ class GemmaForCausalLM(nn.Module):
         target_text の教師強制（Teacher Forcing）を行う例。
 
         入力シーケンスは以下の各部分の連結となる：
-          [instruction_prompt0 のトークン列] +
-          [ダミー位置（VAE埋め込みを直接注入）] +
-          [instruction_prompt1 のトークン列] +
-          [target_text のトークン列（BOS,EOS付き）]
+        [instruction_prompt0 のトークン列] +
+        [ダミー位置（VAE埋め込みを直接注入）] +
+        [instruction_prompt1 のトークン列] +
+        [target_text のトークン列（BOS,EOS付き）]
         
         ※ ダミー位置には embedder の出力ではなく、vae_embedding を直接利用する。
         ※ 損失は target_text 部分（連結シーケンスの後半部分）のみ計算する。
@@ -896,7 +896,7 @@ class GemmaForCausalLM(nn.Module):
         # 2. 各 target_text を BOS/EOS 付きでトークン化
         target_ids_list = []
         for text in target_texts:
-            tokens = self.tokenizer.encode(text+'\n <end_of_turn>', bos=False, eos=True)
+            tokens = self.tokenizer.encode(text + '\n <end_of_turn>', bos=False, eos=True)
             target_ids_list.append(tokens)
 
         # 3. 各サンプルの最終シーケンスは以下の連結になる：
@@ -918,7 +918,8 @@ class GemmaForCausalLM(nn.Module):
         # 4. 各サンプルの最終トークンID列（固定長 max_seq_len へパディング）
         final_token_ids = []
         for tokens in processed_target_ids_list:
-            full_seq = seq0 + [pad_id] + seq1 + tokens  # dummy の位置には一旦 pad_id を入れる
+            # dummy の位置には一旦 pad_id を入れる
+            full_seq = seq0 + [pad_id] + seq1 + tokens
             if len(full_seq) < max_seq_len:
                 full_seq = full_seq + [pad_id] * (max_seq_len - len(full_seq))
             else:
@@ -928,13 +929,19 @@ class GemmaForCausalLM(nn.Module):
 
         # 5. 注意マスク作成（pad_id でない箇所は True）
         attention_mask = (final_token_ids != pad_id).long()  # [B, max_seq_len]
+        # dummy の位置（インデックス = len(seq0)）は強制的に 1 にする
+        dummy_index = len(seq0)
+        attention_mask[:, dummy_index] = 1
 
         # 6. 全体のトークン埋め込みを取得（VAE埋め込みは後で上書きする）
         token_embeddings = self.embedder(final_token_ids) * normalizer  # [B, max_seq_len, H]
 
-        # 7. dummy の位置（インデックス = len(seq0)）に vae_embedding を直接注入
-        dummy_index = len(seq0)
-        token_embeddings[:, dummy_index:dummy_index+1, :] = vae_embedding.unsqueeze(1) * normalizer
+        # 7. dummy の位置に vae_embedding を注入（in-place ではなく out-of-place 操作）
+        # 元の token_embeddings を分割
+        prefix = token_embeddings[:, :dummy_index, :]
+        suffix = token_embeddings[:, dummy_index+1:, :]
+        dummy_embedding = vae_embedding.unsqueeze(1) * normalizer
+        token_embeddings = torch.cat([prefix, dummy_embedding, suffix], dim=1)
 
         # 8. 位置情報として各位置の freqs_cis を取得
         positions = torch.arange(max_seq_len, device=device)
@@ -991,7 +998,7 @@ class GemmaForCausalLM(nn.Module):
             ignore_index=pad_id,
         )
         loss = (loss * loss_mask.reshape(-1)).sum() / loss_mask.sum()
-        
+
         return loss
 
 

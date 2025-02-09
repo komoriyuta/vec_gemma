@@ -16,9 +16,6 @@ class LinearVAE(nn.Module):
         # Decoder
         self.fc3 = nn.Linear(latent_dim, gpt_input_dim)
         
-        nn.init.xavier_normal_(self.fc11.weight)
-        nn.init.xavier_normal_(self.fc12.weight)
-        nn.init.xavier_normal_(self.fc3.weight)
     def encode(self, x):
         return self.fc11(x), self.fc12(x)
     

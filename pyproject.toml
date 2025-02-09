@@ -18,6 +18,7 @@ dependencies = [
     "sigstore>=1.0.0",
     "tensorboard>=2.18.0",
     "torch>=2.5.1",
+    "torchviz>=0.0.3",
     "transformers>=4.48.1",
     "unidic-lite>=1.0.8",
 ]
