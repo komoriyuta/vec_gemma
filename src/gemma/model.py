@@ -691,6 +691,7 @@ class GemmaForCausalLM(nn.Module):
         top_p: float = 1.0,
         top_k: int = 100,
         instructions: Tuple[str, str] = ("", ""),  # (instruction_prompt0, instruction_prompt1)
+        embedding_length: int = 1,  # ← 追加: VAE 埋め込みを複製するトークン数
     ) -> List[str]:
         """
         VAE埋め込みと、instruction_prompt0, instruction_prompt1（タプルで指定）を条件として与えた上で、
@@ -698,7 +699,7 @@ class GemmaForCausalLM(nn.Module):
 
         入力シーケンスは以下の各部分の連結となる：
           [instruction_prompt0 のトークン列] +
-          [ダミー位置 (後で VAE 埋め込みで上書き)] +
+          [ダミー位置 (後で VAE 埋め込みで上書き；長さ embedding_length)] +
           [instruction_prompt1 のトークン列] +
           [出力トークン（自己回帰的に生成）]
         """
@@ -712,19 +713,20 @@ class GemmaForCausalLM(nn.Module):
         seq1 = self.tokenizer.encode(instruction_prompt1, bos=False, eos=False) if instruction_prompt1 else []
 
         # 2. prefix 部分のトークン列を作成  
-        #    ※ teacher_forcing の実装と同様、[seq0] + [dummy] + [seq1] とする  
+        #    ※ teacher_forcing の実装と同様、[seq0] + [dummy]*embedding_length + [seq1] とする  
         #    dummy の位置（後で VAE 埋め込みで置換する）は、seq0 の直後の位置となる
-        prefix_tokens = seq0 + [pad_id] + seq1
+        prefix_tokens = seq0 + [pad_id] * embedding_length + seq1
         prefix_len = len(prefix_tokens)
 
         # 3. 全シーケンス長は、prefix 長 + 出力トークン数
         total_seq_len = prefix_len + output_len
+        assert total_seq_len <= self.config.max_position_embeddings
 
         # 4. 生成結果用の token ID テンソルを初期化（全体を pad_id で埋める）
         token_ids_tensor = torch.full(
             (batch_size, total_seq_len),
             pad_id,
-            dtype=torch.long,
+            dtype=torch.int64,
             device=device,
         )
         # prefix 部分はすべてのサンプルで同じなので、展開して配置する
@@ -734,15 +736,11 @@ class GemmaForCausalLM(nn.Module):
         # 5. KV キャッシュの初期化
         kv_caches = []
         for _ in range(self.config.num_hidden_layers):
-            size = (
-                batch_size,
-                total_seq_len,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-            )
+            size = (batch_size, total_seq_len, self.config.num_key_value_heads,
+                    self.config.head_dim)
             dtype = self.config.get_dtype()
-            k_cache = torch.zeros(size, dtype=dtype, device=device)
-            v_cache = torch.zeros(size, dtype=dtype, device=device)
+            k_cache = torch.zeros(size=size, dtype=dtype, device=device)
+            v_cache = torch.zeros(size=size, dtype=dtype, device=device)
             kv_caches.append((k_cache, v_cache))
 
         # 6. 因果的マスクの作成
@@ -756,10 +754,12 @@ class GemmaForCausalLM(nn.Module):
 
         normalizer = self.config.hidden_size ** 0.5
 
-        # 7. prefix 部分の埋め込みを取得し、dummy の位置（インデックス = len(seq0)）を VAE 埋め込みで上書き
+        # 7. prefix 部分の埋め込みを取得し、dummy の位置（インデックス = len(seq0)～len(seq0)+embedding_length-1）を VAE 埋め込みで上書き
         prefix_embeddings = self.embedder(token_ids_tensor[:, :prefix_len]) * normalizer  # [B, prefix_len, H]
         dummy_index = len(seq0)
-        prefix_embeddings[:, dummy_index:dummy_index + 1, :] = initial_embedding * normalizer
+        # initial_embedding は [B, 1, H] なので embedding_length 回複製
+        repeated_embedding = initial_embedding.repeat(1, embedding_length, 1) * normalizer
+        prefix_embeddings[:, dummy_index:dummy_index + embedding_length, :] = repeated_embedding
 
         # 8. prefix 部分をまとめてモデルに通して、KV キャッシュに情報を蓄積
         input_positions = torch.arange(prefix_len, device=device)
@@ -808,18 +808,17 @@ class GemmaForCausalLM(nn.Module):
             output_offset += 1
 
         # 10. 生成結果のトークン列（prefix 部分を除く）をデコードして出力
+        token_ids = token_ids_tensor.tolist()
         results = []
-        for i in range(batch_size):
-            out_tokens = token_ids_tensor[i, prefix_len:].tolist()
-            if eos_id in out_tokens:
-                idx = out_tokens.index(eos_id)
-                out_tokens = out_tokens[:idx]
-            text = self.tokenizer.decode(out_tokens)
-            results.append(text)
+        for i, tokens in enumerate(token_ids):
+            trimmed_output = tokens[prefix_len:prefix_len + output_len]
+            if eos_id in trimmed_output:
+                eos_index = trimmed_output.index(eos_id)
+                trimmed_output = trimmed_output[:eos_index]
+            results.append(self.tokenizer.decode(trimmed_output))
+
         torch.cuda.empty_cache()
         return results
-
-
 
     def encode_texts(
         self,
@@ -868,17 +867,18 @@ class GemmaForCausalLM(nn.Module):
         target_texts: List[str],            # 教師データのテキスト（各サンプル）
         max_seq_len: int = 512,
         instructions: Tuple[str, str] = ("", ""),  # (instruction_prompt0, instruction_prompt1)
+        embedding_length: int = 1,  # ← 追加: VAE 埋め込みの長さ（複製するトークン数）
     ) -> torch.Tensor:
         """
         VAE埋め込みをprefixとして、instruction_prompt0とinstruction_prompt1を条件として与えた上で、
         target_text の教師強制（Teacher Forcing）を行う例。
 
         入力シーケンスは以下の各部分の連結となる：
-        [instruction_prompt0 のトークン列] +
-        [ダミー位置（VAE埋め込みを直接注入）] +
-        [instruction_prompt1 のトークン列] +
-        [target_text のトークン列（BOS,EOS付き）]
-        
+          [instruction_prompt0 のトークン列] +
+          [ダミー位置（VAE 埋め込みを直接注入；長さ embedding_length）] +
+          [instruction_prompt1 のトークン列] +
+          [target_text のトークン列（BOS,EOS付き）]
+
         ※ ダミー位置には embedder の出力ではなく、vae_embedding を直接利用する。
         ※ 損失は target_text 部分（連結シーケンスの後半部分）のみ計算する。
         """
@@ -900,9 +900,8 @@ class GemmaForCausalLM(nn.Module):
             target_ids_list.append(tokens)
 
         # 3. 各サンプルの最終シーケンスは以下の連結になる：
-        #    sequence = seq0 + [dummy] + seq1 + target_tokens
-        # ここで dummy は実際のトークンIDは不要（後で vae_embedding により置換する）
-        prefix_length = len(seq0) + 1 + len(seq1)  # 条件部分＋VAE埋め込み分
+        #    sequence = seq0 + [dummy]*embedding_length + seq1 + target_tokens
+        prefix_length = len(seq0) + embedding_length + len(seq1)
 
         # 各サンプルで target 部分の最大長を算出
         max_target_len = max_seq_len - prefix_length
@@ -919,7 +918,7 @@ class GemmaForCausalLM(nn.Module):
         final_token_ids = []
         for tokens in processed_target_ids_list:
             # dummy の位置には一旦 pad_id を入れる
-            full_seq = seq0 + [pad_id] + seq1 + tokens
+            full_seq = seq0 + [pad_id] * embedding_length + seq1 + tokens
             if len(full_seq) < max_seq_len:
                 full_seq = full_seq + [pad_id] * (max_seq_len - len(full_seq))
             else:
@@ -929,9 +928,9 @@ class GemmaForCausalLM(nn.Module):
 
         # 5. 注意マスク作成（pad_id でない箇所は True）
         attention_mask = (final_token_ids != pad_id).long()  # [B, max_seq_len]
-        # dummy の位置（インデックス = len(seq0)）は強制的に 1 にする
+        # dummy の位置（インデックス = len(seq0)～len(seq0)+embedding_length-1）は強制的に 1 にする
         dummy_index = len(seq0)
-        attention_mask[:, dummy_index] = 1
+        attention_mask[:, dummy_index:dummy_index + embedding_length] = 1
 
         # 6. 全体のトークン埋め込みを取得（VAE埋め込みは後で上書きする）
         token_embeddings = self.embedder(final_token_ids) * normalizer  # [B, max_seq_len, H]
@@ -939,8 +938,9 @@ class GemmaForCausalLM(nn.Module):
         # 7. dummy の位置に vae_embedding を注入（in-place ではなく out-of-place 操作）
         # 元の token_embeddings を分割
         prefix = token_embeddings[:, :dummy_index, :]
-        suffix = token_embeddings[:, dummy_index+1:, :]
-        dummy_embedding = vae_embedding.unsqueeze(1) * normalizer
+        suffix = token_embeddings[:, dummy_index + embedding_length:, :]
+        # vae_embedding は [B, H] なので unsqueeze して embedding_length 回複製
+        dummy_embedding = vae_embedding.unsqueeze(1).repeat(1, embedding_length, 1) * normalizer
         token_embeddings = torch.cat([prefix, dummy_embedding, suffix], dim=1)
 
         # 8. 位置情報として各位置の freqs_cis を取得
@@ -1000,7 +1000,6 @@ class GemmaForCausalLM(nn.Module):
         loss = (loss * loss_mask.reshape(-1)).sum() / loss_mask.sum()
 
         return loss
-
 
 #追加実装ここまで
     def load_weights(self, model_path: str):

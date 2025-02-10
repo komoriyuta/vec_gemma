@@ -42,9 +42,9 @@ class TrainingConfig:
         self.lr = 1e-4
         self.num_epochs = 10
         self.grad_accum_steps = 4
-        self.beta_init = 0.0
+        self.beta_init = 0.1
         self.beta_max = 0.4
-        self.beta_step = 1e-6
+        self.beta_step = 1e-5
         self.crop_lambda = 0.2
 
         # モデル設定
@@ -180,7 +180,8 @@ def generate_and_log_samples(vae_model, bert_model, gemma_model, device, writer,
                     temperature=config.generation_temp,
                     top_p=config.generation_top_p,
                     top_k=config.generation_top_k,
-                    instructions=("<start_of_turn>user以下の内容をそのまま再現してください:\"", "\"\n<end_of_turn><start_of_turn>model\n")
+                    instructions=("<start_of_turn>user以下の内容をそのまま再現してください:\"", "\"\n<end_of_turn><start_of_turn>model\n"),
+                    embedding_length=10
                 )
                 generated_texts.append(generated[0])
             except Exception as e:
@@ -278,6 +279,7 @@ def train(config, vae_model, bert_model, gemma_model, optimizer, device, start_e
                     batch_texts,
                     max_seq_len=config.max_seq_len,
                     instructions=instructions[random.randint(0, len(instructions)-1)],
+                    embedding_length=10
                 )
                 
                 loss = recon_loss + beta * kl_div
